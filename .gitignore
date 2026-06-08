@@ -1,0 +1,11 @@
+.env
+__pycache__/
+.venv/
+*.pyc
+clinic.db
+local.db
+clinical.db
+sqlite.db
+*.db
+skills/
+.claude/

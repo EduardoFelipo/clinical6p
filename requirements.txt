@@ -1,0 +1,15 @@
+fastapi
+groq
+uvicorn[standard]
+sqlalchemy
+psycopg[binary]
+pydantic
+pydantic-settings
+python-dotenv
+python-multipart>=0.0.18
+pyjwt>=2.8.0
+passlib[bcrypt]
+email-validator
+aiosqlite
+argon2-cffi
+slowapi

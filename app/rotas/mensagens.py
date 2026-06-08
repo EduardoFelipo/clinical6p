@@ -1,0 +1,290 @@
+"""
+Rotas de Mensagens de Pacientes
+- Envio de mensagem (autenticado por CPF + senha do paciente)
+- Listagem de mensagens (com filtro por profissional)
+- Contagem de não lidas
+- Marcar como lida
+"""
+
+from typing import Any
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from sqlalchemy import select, func, desc
+from sqlalchemy.orm import selectinload
+
+from app.database import AsyncSession, get_db
+from app.models import Patient, PatientMessage, Professional
+from app.schemas import PatientMessageCreate, PatientMessageResponse
+from app.auth import verify_password, get_current_user
+from app.email_utils import bg_send_patient_message_notification
+
+from typing import Optional
+
+router = APIRouter(prefix="/api", tags=["Mensagens de Pacientes"])
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ENDPOINTS DO PORTAL DO PACIENTE (ENVIO)
+# ═════════════════════════════════════════════════════════════════════
+
+@router.post("/patient-contact")
+async def send_patient_message(
+    message_data: PatientMessageCreate,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    """
+    [EXPLICAÇÃO DIDÁTICA PARA INICIANTES]
+    A 'função' (async def) de Caixa de Correio do Paciente.
+    Como o paciente NÃO possui um sistema de login clássico, o computador atua como um Porteiro ranzinza: Ele exige obrigatoriamente que o paciente forneça seu "CPF" e sua "Senha" preenchidos no formulário da mensagem na hora do envio.
+    O Porteiro vê se a senha está correta. Se estiver falso, barra (Erro 401).
+    Se estiver tudo OK, guarda a mensagem no arquivo. De bônus, notifica o "Carteiro Interno" (sen_patient_message_notification) para mandar um e-mail pro Psicólogo com o recado: "Você tem nova mensagem lá no sistema!".
+    """
+    stmt = select(Patient).options(selectinload(Patient.professional)).where(Patient.cpf == message_data.cpf)
+    result = await db.execute(stmt)
+    patient = result.scalars().first()
+
+    if not patient or not patient.hashed_password or not verify_password(message_data.password, patient.hashed_password):
+        raise HTTPException(status_code=401, detail="CPF ou senha inválidos")
+
+    if not patient.professional_id:
+        raise HTTPException(status_code=400, detail="Paciente não possui um profissional vinculado para receber mensagens")
+
+    db_msg = PatientMessage(
+        patient_id=patient.id,
+        professional_id=patient.professional_id,
+        message=message_data.message
+    )
+    db.add(db_msg)
+    await db.commit()
+
+    # Notifica o profissional em background — response retorna imediatamente
+    if patient.professional and patient.professional.email:
+        background_tasks.add_task(
+            bg_send_patient_message_notification,
+            patient.professional.email,
+            patient.professional.name,
+            patient.name,
+        )
+
+    return {"message": "Mensagem enviada com sucesso"}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ENDPOINTS DO DASHBOARD (LEITURA E GERENCIAMENTO)
+# ═════════════════════════════════════════════════════════════════════
+
+@router.get("/patients/{patient_id}/messages")
+async def list_patient_messages(
+    patient_id: int,
+    saved_only: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> list[dict]:
+    """Retorna mensagens de um paciente específico. Com saved_only=true retorna apenas as salvas no card."""
+    query = (
+        select(PatientMessage)
+        .where(PatientMessage.patient_id == patient_id)
+        .order_by(desc(PatientMessage.created_at))
+    )
+    if saved_only:
+        query = query.where(PatientMessage.saved == True)
+
+    role = current_user.get("role", "")
+    caller_email = current_user.get("email", "")
+    if role != "admin":
+        stmt_prof = select(Professional.id).where(Professional.email == caller_email)
+        prof_id_result = await db.execute(stmt_prof)
+        prof_id = prof_id_result.scalar()
+        if prof_id:
+            query = query.where(PatientMessage.professional_id == prof_id)
+
+    result = await db.execute(query)
+    messages = result.scalars().all()
+
+    return [
+        {
+            "id": m.id,
+            "message": m.message,
+            "is_read": m.is_read,
+            "saved": m.saved,
+            "created_at": m.created_at,
+        }
+        for m in messages
+    ]
+
+
+@router.get("/patient-messages", response_model=list[PatientMessageResponse])
+async def list_messages(
+    professional_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """
+    Lista mensagens de pacientes.
+    Admin → pode ver todas (ou filtrar por professional_id).
+    Profissional não-admin → vê somente suas próprias mensagens (CWE-639 fix).
+    """
+    query = (
+        select(PatientMessage)
+        .options(selectinload(PatientMessage.patient), selectinload(PatientMessage.professional))
+        .order_by(desc(PatientMessage.created_at))
+    )
+
+    role = current_user.get("role", "")
+    caller_email = current_user.get("email", "")
+
+    if role != "admin":
+        # Busca o professional_id associado ao e-mail do usuário logado
+        stmt_prof = select(Professional.id).where(Professional.email == caller_email)
+        prof_id_result = await db.execute(stmt_prof)
+        prof_id = prof_id_result.scalar()
+        if not prof_id:
+            raise HTTPException(status_code=403, detail="Profissional não associado a este usuário.")
+        query = query.where(PatientMessage.professional_id == prof_id)
+    elif professional_id:
+        # Admin pode filtrar por profissional específico
+        query = query.where(PatientMessage.professional_id == professional_id)
+
+    result = await db.execute(query)
+    messages = result.scalars().all()
+
+    return [
+        {
+            "id": m.id,
+            "patient_id": m.patient_id,
+            "professional_id": m.professional_id,
+            "message": m.message,
+            "is_read": m.is_read,
+            "saved": m.saved,
+            "patient_name": m.patient.name if m.patient else None,
+            "professional_name": m.professional.name if m.professional else None,
+            "created_at": m.created_at
+        }
+        for m in messages
+    ]
+
+
+@router.get("/patient-messages/unread")
+async def count_unread_messages(
+    professional_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+) -> dict[str, int]:
+    """
+    [EXPLICAÇÃO DIDÁTICA PARA INICIANTES]
+    A 'função' Calculadora Rápida de Notificações.
+    Sabe aquela bolinha vermelha irritante tipo no ícone do Whatsapp contendo o número de msgs não lidas? É esta função aqui que descobre ele!
+    Ela faz um 'select(func.count)' perguntando ao banco: "Ei, me conta na ponta do lápis qual a quantidade onde o estado de leitura é FALSO (is_read == False)?". Retorna só o número isolado. É rapidíssimo.
+    """
+    query = select(func.count(PatientMessage.id)).where(PatientMessage.is_read == False)
+
+    role = current_user.get("role", "")
+    caller_email = current_user.get("email", "")
+
+    if role != "admin":
+        # Busca o professional_id associado ao e-mail do usuário logado e força o filtro
+        stmt_prof = select(Professional.id).where(Professional.email == caller_email)
+        prof_id_result = await db.execute(stmt_prof)
+        prof_id = prof_id_result.scalar()
+        if not prof_id:
+            raise HTTPException(status_code=403, detail="Profissional não associado a este usuário.")
+        query = query.where(PatientMessage.professional_id == prof_id)
+    elif professional_id:
+        query = query.where(PatientMessage.professional_id == professional_id)
+
+    count = await db.scalar(query) or 0
+    return {"count": count}
+
+
+@router.put("/patient-messages/{message_id}/save")
+async def save_message_to_patient_card(
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+) -> dict[str, str]:
+    """Marca a mensagem como salva no card do paciente."""
+    stmt = select(PatientMessage).where(PatientMessage.id == message_id)
+    result = await db.execute(stmt)
+    msg = result.scalars().first()
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="Mensagem não encontrada.")
+
+    role = current_user.get("role", "")
+    caller_email = current_user.get("email", "")
+
+    if role != "admin":
+        stmt_prof = select(Professional.id).where(Professional.email == caller_email)
+        prof_id_result = await db.execute(stmt_prof)
+        prof_id = prof_id_result.scalar()
+        if not prof_id or msg.professional_id != prof_id:
+            raise HTTPException(status_code=403, detail="Você não tem permissão para salvar esta mensagem.")
+
+    msg.saved = True
+    await db.commit()
+    return {"message": "Mensagem salva no card do paciente."}
+
+
+@router.put("/patient-messages/{message_id}/unsave")
+async def unsave_message_from_patient_card(
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+) -> dict[str, str]:
+    """Remove a marcação de salvo no card do paciente."""
+    stmt = select(PatientMessage).where(PatientMessage.id == message_id)
+    result = await db.execute(stmt)
+    msg = result.scalars().first()
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="Mensagem não encontrada.")
+
+    role = current_user.get("role", "")
+    caller_email = current_user.get("email", "")
+
+    if role != "admin":
+        stmt_prof = select(Professional.id).where(Professional.email == caller_email)
+        prof_id_result = await db.execute(stmt_prof)
+        prof_id = prof_id_result.scalar()
+        if not prof_id or msg.professional_id != prof_id:
+            raise HTTPException(status_code=403, detail="Você não tem permissão para alterar esta mensagem.")
+
+    msg.saved = False
+    await db.commit()
+    return {"message": "Mensagem removida do card do paciente."}
+
+
+@router.put("/patient-messages/{message_id}/read")
+async def mark_message_as_read(
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+) -> dict[str, str]:
+    """
+    [EXPLICAÇÃO DIDÁTICA PARA INICIANTES]
+    A 'função' Marca-Texto.
+    Quando o profissional clica em "Marcar como Lido" perto daquela mensagem específica, a função simplesmente fisga a mensagem pelo seu ID no banco e altera o seu adesivo de "FALSO" para "VERDADEIRO" (msg.is_read = True).
+    A bolinha vermelha da notificação da nossa função de cima apaga magicamente logo em seguida porque ele deixou de ser "Falso"!
+    """
+    stmt = select(PatientMessage).where(PatientMessage.id == message_id)
+    result = await db.execute(stmt)
+    msg = result.scalars().first()
+
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    role = current_user.get("role", "")
+    caller_email = current_user.get("email", "")
+
+    if role != "admin":
+        # Busca o professional_id associado ao e-mail do usuário logado
+        stmt_prof = select(Professional.id).where(Professional.email == caller_email)
+        prof_id_result = await db.execute(stmt_prof)
+        prof_id = prof_id_result.scalar()
+        if not prof_id or msg.professional_id != prof_id:
+            raise HTTPException(status_code=403, detail="Você não tem permissão para marcar esta mensagem como lida.")
+
+    msg.is_read = True
+    await db.commit()
+
+    return {"message": "Marcado como lido"}
